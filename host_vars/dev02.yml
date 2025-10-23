@@ -1,0 +1,8 @@
+restic_repo: "sftp:mjouhari@87.106.192.195:/home/mjouhari/devs/dev02"
+restic_password: "5225m_jouhari"
+backup_paths:
+  - /opt/zabbix
+backup_time: "14:50"
+user_password: "7sXm:D72oR{j]IK\"7[o}"
+sftp_password: "7sXm:D72oR{j]IK\"7[o}"
+

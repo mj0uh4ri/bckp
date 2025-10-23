@@ -1,0 +1,8 @@
+restic_repo: "sftp:mjouhari@87.106.192.195:/home/mjouhari/devs/dev02"
+restic_password: ""
+backup_paths:
+  - /docker/volumes
+backup_time: "14:50"
+user_password: ""
+sftp_password: ""
+

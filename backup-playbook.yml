@@ -1,0 +1,52 @@
+---
+- name: Deploy Restic backup system
+  hosts: backup_servers
+  become: yes
+  vars_files:
+    - group_vars/backup_servers/vault.yml
+
+  tasks:
+    - name: Copy restic backup script
+      copy:
+        src:  /home/mjouhari/ansbackup/templates/scripts/backup-script.sh  # Path on YOUR Ansible controller machine
+        dest: /home/mjouhari/restic-backup.sh
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+
+    - name: Create environment file for this host
+      copy:
+        dest: /home/mjouhari/restic.env
+        content: |
+          export RESTIC_REPOSITORY="{{ restic_repo }}"
+          export RESTIC_PASSWORD="{{ restic_password }}"
+          export BACKUP_PATHS="{{ backup_paths | join(' ') }}"
+          export LOG_FILE="/home/mjouhari/restic-backup.log"
+          export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
+        mode: '0600'
+        owner: mjouhari
+        group: mjouhari
+
+    - name: Ensure .ssh directory exists for mjouhari
+      file:
+        path: /home/mjouhari/.ssh
+        state: directory
+        owner: mjouhari
+        group: mjouhari
+        mode: '0700'
+
+    - name: Ensure log file exists with correct permissions
+      file:
+        path: /home/mjouhari/restic-backup.log
+        state: touch
+        owner: mjouhari
+        group: mjouhari
+        mode: '0644'
+
+    - name: Create cron job for automated Restic backup
+      cron:
+        name: "Restic automated backup"
+        minute: "{{ backup_time.split(':')[1] }}"
+        hour: "{{ backup_time.split(':')[0] }}"
+        job: "source /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh"
+        user: mjouhari
