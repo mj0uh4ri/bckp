@@ -23,6 +23,12 @@
           export BACKUP_PATHS="{{ backup_paths | join(' ') }}"
           export LOG_FILE="/home/mjouhari/restic-backup.log"
           export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
+
+          export KEEP_HOURLY="{{ restic_retention.keep_hourly | default(0) }}"
+          export KEEP_DAILY="{{ restic_retention.keep_daily | default(7) }}"
+          export KEEP_WEEKLY="{{ restic_retention.keep_weekly | default(4) }}"
+          export KEEP_MONTHLY="{{ restic_retention.keep_monthly | default(6) }}"
+          export KEEP_YEARLY="{{ restic_retention.keep_yearly | default(1) }}"        
         mode: '0600'
         owner: mjouhari
         group: mjouhari
@@ -48,5 +54,5 @@
         name: "Restic automated backup"
         minute: "{{ backup_time.split(':')[1] }}"
         hour: "{{ backup_time.split(':')[0] }}"
-        job: "source /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh"
+        job: "bash -c '. /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh >> /home/mjouhari/restic-backup.log 2>&1'"
         user: mjouhari

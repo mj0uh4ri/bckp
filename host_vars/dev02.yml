@@ -1,7 +1,14 @@
 restic_repo: "sftp:mjouhari@87.106.192.195:/home/mjouhari/devs/dev02"
-restic_password: ""
+restic_password: "5225m_jouhari"
 backup_paths:
   - /docker/volumes
 backup_time: "14:50"
-user_password: ""
-sftp_password: ""
+user_password: "7sXm:D72oR{j]IK\"7[o}" #sudo admin password
+#sftp_password: "7sXm:D72oR{j]IK\"7[o}"
+
+restic_retention:
+  keep_hourly: 12
+  keep_daily: 7
+  keep_weekly: 4
+  keep_monthly: 6
+  keep_yearly: 2

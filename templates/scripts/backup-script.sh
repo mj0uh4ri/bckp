@@ -4,6 +4,11 @@ set -x
 
 # Expect environment variables:
 # RESTIC_REPOSITORY, RESTIC_PASSWORD, BACKUP_PATHS, USER_PASSWORD, SFTP_PASSWORD
+# Load environment variables (if not already sourced by cron)
+if [[ -f "$HOME/restic.env" ]]; then
+  . "$HOME/restic.env"
+fi
+
 
 LOG_FILE=${LOG_FILE:-/var/log/restic-backup.log}
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -38,8 +43,17 @@ read -r -a PATHS <<< "$BACKUP_PATHS"
 restic -r "$RESTIC_REPOSITORY" backup "${PATHS[@]}" --verbose --tag automated
 
 # Retention
-restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
-restic check --read-data-subset=5%
+# Retention cleanup – machine-specific values
+restic forget \
+  --keep-hourly "${KEEP_HOURLY:-0}" \
+  --keep-daily "${KEEP_DAILY:-7}" \
+  --keep-weekly "${KEEP_WEEKLY:-4}" \
+  --keep-monthly "${KEEP_MONTHLY:-6}" \
+  --keep-yearly "${KEEP_YEARLY:-1}" \
+  --prune
+
+restic check --read-data-subset=1/50
+echo "[$(timestamp)] Retention applied: H=${KEEP_HOURLY:-0}, D=${KEEP_DAILY:-7}, W=${KEEP_WEEKLY:-4}, M=${KEEP_MONTHLY:-6}, Y=${KEEP_YEARLY:-1}"
 
 
 
