@@ -1,8 +1,15 @@
 #prod hors infra = dev03
 restic_repo: "sftp:mjouhari@87.106.192.195:/home/mjouhari/devs/dev03"
-restic_password: "5225m_jouhari"
+restic_password: ""
 backup_paths:
   - /api-lyon
 backup_time: "12:36"
-user_password: "7sXm:D72oR{j]IK\"7[o}" #sudo admin password eventually unused cuz we gave necessary privileges to mjouhari
-#sftp_password: "7sXm:D72oR{j]IK\"7[o}"
+user_password: "" #sudo admin password eventually unused cuz we gave necessary privileges to mjouhari
+#sftp_password: ""
+
+restic_retention:
+  keep_hourly: 0
+  keep_daily: 7
+  keep_weekly: 4
+  keep_monthly: 6
+  keep_yearly: 2
