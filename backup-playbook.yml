@@ -20,15 +20,11 @@
         content: |
           export RESTIC_REPOSITORY="{{ restic_repo }}"
           export RESTIC_PASSWORD="{{ restic_password }}"
-          export BACKUP_PATHS="{{ backup_paths | join(' ') }}"
           export LOG_FILE="/home/mjouhari/restic-backup.log"
           export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
 
-          export KEEP_HOURLY="{{ restic_retention.keep_hourly | default(0) }}"
-          export KEEP_DAILY="{{ restic_retention.keep_daily | default(7) }}"
-          export KEEP_WEEKLY="{{ restic_retention.keep_weekly | default(4) }}"
-          export KEEP_MONTHLY="{{ restic_retention.keep_monthly | default(6) }}"
-          export KEEP_YEARLY="{{ restic_retention.keep_yearly | default(1) }}"        
+          export BACKUP_GROUPS='{{ backup_groups | to_json }}'  
+
         mode: '0600'
         owner: mjouhari
         group: mjouhari
@@ -49,10 +45,15 @@
         group: mjouhari
         mode: '0644'
 
-    - name: Create cron job for automated Restic backup
+        # Create separate cron job per group
+    - name: Create cron jobs for each backup group
       cron:
-        name: "Restic automated backup"
-        minute: "{{ backup_time.split(':')[1] }}"
-        hour: "{{ backup_time.split(':')[0] }}"
-        job: "bash -c '. /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh >> /home/mjouhari/restic-backup.log 2>&1'"
-        user: mjouhari
+        name: "Restic backup for {{ item.name }}"
+        user: "{{ ansible_user }}"
+        minute: "{{ item.schedule.split(' ')[0] }}"
+        hour: "{{ item.schedule.split(' ')[1] }}"
+        day: "{{ item.schedule.split(' ')[2] }}"
+        month: "{{ item.schedule.split(' ')[3] }}"
+        weekday: "{{ item.schedule.split(' ')[4] }}"
+        job: "bash -c '. /home/{{ ansible_user }}/restic.env && /home/mehdi/restic-backup.sh {{ item.name }} >> /home/{{ ansible_user }}/restic-backup.log 2>&1'"
+      loop: "{{ backup_groups }}"

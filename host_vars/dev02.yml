@@ -1,14 +1,29 @@
 restic_repo: "sftp:mjouhari@87.106.192.195:/home/mjouhari/devs/dev02"
-restic_password: ""
-backup_paths:
-  - /docker/volumes
-backup_time: "14:50"
-user_password: "" #sudo admin password
-#sftp_password: ""
+restic_password: "5225m_jouhari"
 
-restic_retention:
-  keep_hourly: 12
-  keep_daily: 7
-  keep_weekly: 4
-  keep_monthly: 6
-  keep_yearly: 2
+backup_groups:
+  - name: "app"
+    paths:
+      - /opt/api-lyon
+    schedule: "0 2 * * *"  # daily at 02:00
+    retention:
+      keep_daily: 7
+      keep_weekly: 4
+      keep_monthly: 2
+
+  - name: "monitoring"
+    paths:
+      - /opt/zabbix
+    schedule: "0 */6 * * *"  # every 6 hours
+    retention:
+      keep_daily: 14
+      keep_weekly: 8
+      keep_monthly: 3
+
+  - name: "configs"
+    paths:
+      - /etc
+      - /opt/bookstack
+    schedule: "30 1 * * 0"  # weekly, Sundays at 01:30
+    retention:
+      keep_monthly: 12
