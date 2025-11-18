@@ -42,36 +42,77 @@
         group: mjouhari
         mode: '0644'
 
+
+    - name: Parse Restic repo path
+      set_fact:
+        # Strip 'sftp:' prefix if present, then parse user@host:/path
+        _repo_without_protocol: "{{ restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo }}"
+        restic_remote_user: "{{ (restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[0] }}"
+        restic_remote_host: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[1].split(':')[0]) if '@' in restic_repo else '87.106.192.195' }}"
+        restic_remote_dir: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split(':')[-1]) }}"
+
     # --------------------------------------
-    # Step 0: Check if host-specific repo exists
-    - name: Check if Restic repository exists for this host
+    # Step 0: Check if host-specific repo exists (from controller)
+    - name: Check if restic repo exists for this host (from controller)
+      delegate_to: localhost
+      become: no
       shell: |
-        ssh -i /home/mjouhari/.ssh/restic_key -o StrictHostKeyChecking=no ConnectTimeout=10 \
-        mjouhari@87.106.192.195 \
-        "test -f /home/mjouhari/devs/{{ inventory_hostname }}/config && echo 'exists' || echo 'missing'"
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            -o PasswordAuthentication=no -o BatchMode=yes \
+          {{ restic_remote_user }}@{{ restic_remote_host }} \
+          "test -d {{ restic_remote_dir }}/{{ inventory_hostname }} && echo 'exists' || echo 'missing'"
       register: repo_check
       changed_when: false
       failed_when: false
 
-    - name: Set boolean flag if repo exists
+    - name: Display repo check details
+      delegate_to: localhost
+      become: no
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════
+          RESTIC REPOSITORY CHECK - {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════════════
+          
+          Connection Details:
+            • Remote User: {{ restic_remote_user }}
+            • Remote Host: {{ restic_remote_host }}
+            • Repo Base Path: {{ restic_remote_dir }}
+            • Host Repo Path: {{ restic_remote_dir }}/{{ inventory_hostname }}
+          
+          Connection Status:
+          {% if repo_check.rc == 0 %}
+            ✓ SSH Connection: SUCCESS
+          {% else %}
+            ✗ SSH Connection: FAILED (rc={{ repo_check.rc }})
+            Error: {{ repo_check.stderr | default('unknown') }}
+          {% endif %}
+          
+          Repository Status:
+          {% if repo_check.stdout | trim == 'exists' %}
+            ✓ Repository EXISTS - Will fetch password from Vault
+          {% else %}
+            ⚠ Repository MISSING - Will initialize new repository
+          {% endif %}
+          
+          ═══════════════════════════════════════════════════════════════
+
+    - name: Determine whether repo exists for this host
       set_fact:
-        repo_exists: "{{ repo_check.stdout == 'exists' }}"
+        repo_exists: "{{ ((repo_check.stdout | default('') | trim) == 'exists') | bool }}"
+    
 
     # --------------------------------------
     # Step 1: Fetch password from Vault if repo exists
     - name: Fetch Restic password from Vault if repo exists
       community.hashi_vault.vault_read:
-        url: "{{ vault_addr }}"
-        token: "{{ vault_token }}"
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
         path: "restic/data/{{ inventory_hostname }}"
       register: vault_read
-      when: repo_exists
+      when: repo_exists | bool
       ignore_errors: yes
 
-    - name: Set Restic password from Vault
-      set_fact:
-        restic_password: "{{ vault_read.data.data.data.restic_pass }}"
-      when: repo_exists and vault_read.failed is not defined
 
     # --------------------------------------
     # Step 2: Generate new password if repo missing
@@ -82,19 +123,73 @@
 
     - name: Store new Restic password in Vault
       community.hashi_vault.vault_write:
-        url: "{{ vault_addr }}"
-        token: "{{ vault_token }}"
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
         path: "restic/data/{{ inventory_hostname }}"
         data:
           data:
             restic_pass: "{{ restic_password }}"
-      when: not repo_exists
+      when: not (repo_exists | bool)
+
+
+
+    - name: Set Restic password from Vault (safe extraction)
+      set_fact:
+        restic_password: >-
+          {{ (
+              (vault_read.data.data.restic_pass)
+              if (vault_read is defined and vault_read.data is defined and vault_read.data.data is defined and 'restic_pass' in vault_read.data.data)
+              else (
+                (vault_read.data.restic_pass)
+                if (vault_read is defined and vault_read.data is defined and 'restic_pass' in vault_read.data)
+                else ''
+              )
+            ) }}
+      when: repo_exists | bool and (vault_read is defined) and (vault_read.failed is not defined)
+      no_log: yes
+
+
+
+    - name: Ensure restic_password is defined
+      set_fact:
+        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+      no_log: yes
+
+
+    - name: Debug vault_read status
+      debug:
+        msg:
+        - "vault_read defined: {{ vault_read is defined }}"
+        - "vault_read.failed: {{ vault_read.failed | default(false) }}"
+        - "vault_read data present: {{ (vault_read.data is defined) | string }}"
+      when: repo_exists | bool
+
+    - name: Debug restic_password presence (masked info)
+      debug:
+        msg: "restic_password defined: {{ restic_password is defined }}, length: {{ restic_password | default('') | length }}"
+      no_log: true
+
+    - name: Debug repo_exists value and type
+      debug:
+        msg:
+          - "repo_exists value: {{ repo_exists }}"
+          - "repo_exists type: {{ repo_exists | type_debug }}"
+      when: repo_exists is defined
+
+
+    # --------------------------------------
+    # Step 4: Ensure restic_password is always defined
+    - name: Ensure restic_password is defined
+      set_fact:
+        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+      no_log: yes
 
     # --------------------------------------
     # Step 3: Initialize Restic repository if missing
     - name: Initialize Restic repository for host
       become: yes
       become_user: "{{ restic_user | default('mjouhari') }}"
+      when: not (repo_exists | default(false) | bool)
       environment:
         RESTIC_PASSWORD: "{{ restic_password }}"
         RESTIC_REPOSITORY: "{{ restic_repo }}"
@@ -104,23 +199,30 @@
       changed_when: restic_init.rc == 0
       failed_when: restic_init.rc != 0 and "'already initialized' not in (restic_init.stdout + restic_init.stderr)"
 
-    # --------------------------------------
-    # Step 4: Ensure restic_password is always defined
-    - name: Ensure restic_password is defined
-      set_fact:
-        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+
 
     # --------------------------------------
-    # Step 5: Create environment file for backup
+    # Step 5: Create environment file for backup (password excluded)
     - name: Create environment file for this host
+      become: yes
+      become_user: mjouhari
       copy:
         dest: /home/mjouhari/restic.env
         content: |
           export RESTIC_REPOSITORY="{{ restic_repo }}"
-          export RESTIC_PASSWORD="{{ restic_password }}"
           export LOG_FILE="/home/mjouhari/restic-backup.log"
           export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
           export BACKUP_GROUPS='{{ backup_groups | to_json }}'
         mode: '0600'
         owner: mjouhari
         group: mjouhari
+  # Step 6: Run backup script with injected password (Solution 5)
+    - name: Run Restic backup with secure password injection
+      shell: |
+        source /home/mjouhari/restic.env
+        /home/mjouhari/restic-backup.sh
+      environment:
+        RESTIC_PASSWORD: "{{ restic_password }}"
+      become_user: mjouhari
+      register: backup_result
+      failed_when: backup_result.rc != 0
