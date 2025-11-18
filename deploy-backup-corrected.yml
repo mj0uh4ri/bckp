@@ -1,0 +1,350 @@
+---
+- name: Deploy Restic backup system
+  hosts: backup_servers
+  become: yes
+  vars_files:
+    - "/home/mjouhari/ansbackup/inventory/hosts_vars/vault.yml"
+
+  vars:
+    # Vault paths for storing passwords (controller will read/write and push to systemd credentials)
+    vault_base_path: "restic/data"
+    vault_secret_path: "{{ vault_base_path }}/{{ inventory_hostname }}"
+    # systemd credential name (will be created under /run/credentials/)
+    restic_cred_name: "restic-{{ inventory_hostname }}"
+
+  tasks:
+    # =========== PHASE 1: Setup (runs unconditionally) ===========
+    
+    - name: Copy restic backup script
+      copy:
+        src: /home/mjouhari/ansbackup/templates/scripts/backup-script.sh
+        dest: /home/mjouhari/restic-backup.sh
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+
+    - name: Ensure .ssh directory exists for mjouhari
+      file:
+        path: /home/mjouhari/.ssh
+        state: directory
+        owner: mjouhari
+        group: mjouhari
+        mode: '0700'
+
+    - name: Ensure log file exists with correct permissions
+      file:
+        path: /home/mjouhari/restic-backup.log
+        state: touch
+        owner: mjouhari
+        group: mjouhari
+        mode: '0644'
+
+    # =========== PHASE 2: Repository Detection ===========
+    
+    - name: Parse Restic repo path from sftp URL
+      set_fact:
+        # Extract components from sftp:user@host:/path format
+        restic_remote_user: "{{ (restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[0] }}"
+        restic_remote_host: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[1].split(':')[0]) if '@' in restic_repo else '87.106.192.195' }}"
+        restic_remote_dir: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split(':')[-1]) }}"
+
+    - name: Check if host-specific repository folder exists on remote
+      delegate_to: localhost
+      become: no
+      shell: |
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            -o PasswordAuthentication=no -o BatchMode=yes \
+          {{ restic_remote_user }}@{{ restic_remote_host }} \
+          "if [ -d '{{ restic_remote_dir }}/{{ inventory_hostname }}' ]; then echo 'exists'; else echo 'missing'; fi"
+      register: repo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display repository detection results
+      delegate_to: localhost
+      become: no
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════
+          RESTIC REPOSITORY DETECTION - {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════════════
+          
+          Connection Details:
+            • Remote User: {{ restic_remote_user }}
+            • Remote Host: {{ restic_remote_host }}
+            • Repository Base Path: {{ restic_remote_dir }}
+            • Host Subdirectory: {{ restic_remote_dir }}/{{ inventory_hostname }}
+          
+          SSH Connection Status:
+          {% if repo_check.rc == 0 %}
+            ✓ SUCCESS
+          {% else %}
+            ✗ FAILED (rc={{ repo_check.rc }})
+            Error: {{ repo_check.stderr | default('unknown') }}
+          {% endif %}
+          
+          Repository Status:
+          {% if (repo_check.stdout | default('') | trim) == 'exists' %}
+            ✓ EXISTS - Will fetch password from Vault
+          {% else %}
+            ⚠ MISSING - Will generate new password and initialize
+          {% endif %}
+          
+          ═══════════════════════════════════════════════════════════════
+
+    - name: Set repository existence flag
+      set_fact:
+        repo_exists: "{{ (repo_check.stdout | default('') | trim) == 'exists' }}"
+        # Construct the full sftp URL for the host-specific repository
+        restic_repo_url: "sftp:{{ restic_remote_user }}@{{ restic_remote_host }}:{{ restic_remote_dir }}/{{ inventory_hostname }}"
+
+    # =========== PHASE 3: Password Handling ===========
+    
+    # Controller-side Vault read/write and generation. The controller will place the
+    # credential under /run/credentials/{{ restic_cred_name }} on the target host so
+    # the systemd unit can use LoadCredential to receive it at runtime.
+
+    - name: Fetch Restic password from Vault on controller (if repository exists)
+      delegate_to: localhost
+      become: no
+      community.hashi_vault.vault_read:
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        path: "{{ vault_secret_path }}"
+      register: vault_read
+      when: repo_exists | bool
+      ignore_errors: yes
+
+    - name: Extract password from Vault response (controller)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: >-
+          {{ (
+              (vault_read.data.data.restic_pass)
+              if (vault_read is defined and vault_read.data is defined and vault_read.data.data is defined and 'restic_pass' in vault_read.data.data)
+              else (
+                (vault_read.data.restic_pass)
+                if (vault_read is defined and vault_read.data is defined and 'restic_pass' in vault_read.data)
+                else ''
+              )
+            ) }}
+      when: repo_exists | bool and vault_read is defined and vault_read.failed is not defined
+      no_log: yes
+
+    - name: Generate new strong password on controller (if repository missing)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      when: not (repo_exists | bool)
+      no_log: yes
+
+    - name: Store new password in Vault (controller) if repository missing
+      delegate_to: localhost
+      become: no
+      community.hashi_vault.vault_write:
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        path: "{{ vault_secret_path }}"
+        data:
+          data:
+            restic_pass: "{{ restic_password }}"
+      when: not (repo_exists | bool)
+      no_log: yes
+
+    - name: Ensure password is defined (fallback controller-side)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+      no_log: yes
+
+    # =========== PHASE 4: Repository Initialization ===========
+    
+    - name: Initialize repository with restic (if repository missing)
+      become_user: mjouhari
+      environment:
+        RESTIC_PASSWORD: "{{ restic_password }}"
+        RESTIC_REPOSITORY: "{{ restic_repo_url }}"
+        RESTIC_SFTP_ARGS: "-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+      command: restic init
+      register: repo_init
+      when: not (repo_exists | bool)
+      changed_when: "'created restic repository' in repo_init.stdout"
+      failed_when: repo_init.rc != 0 and "'already initialized' not in repo_init.stderr"
+      no_log: yes
+
+    # =========== PHASE 5: Runtime Configuration Files ===========
+    
+    - name: Create environment file for runtime (stores paths, not secrets)
+      copy:
+        dest: /home/mjouhari/restic.env
+        content: |
+          # Restic backup environment file for {{ inventory_hostname }}
+          # Generated by Ansible deployment
+          
+          # Repository configuration (with full sftp URL)
+          export RESTIC_REPOSITORY="{{ restic_repo_url }}"
+          export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
+          
+          # Logging
+          export LOG_FILE="/home/mjouhari/restic-backup.log"
+          
+          # Backup groups (defines what gets backed up and schedules)
+          export BACKUP_GROUPS='{{ backup_groups | to_json }}'
+          
+          # Credential configuration (systemd credential name)
+          export RESTIC_CRED_NAME="{{ restic_cred_name }}"
+        mode: '0600'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Deploy password fetcher script (queries Vault at runtime)
+      copy:
+        dest: /home/mjouhari/fetch-restic-password.sh
+        content: |
+          #!/bin/bash
+          # Fetches the Restic password from systemd credential location
+          # Returns the password on stdout. Exits non-zero if missing.
+
+          set -euo pipefail
+
+          # Load environment (contains RESTIC_CRED_NAME)
+          if [[ -f "${HOME}/restic.env" ]]; then
+            source "${HOME}/restic.env"
+          fi
+
+          # Default to configured name or per-host name
+          CRED_NAME="${RESTIC_CRED_NAME:-restic-$(hostname -s)}"
+          CRED_PATH="/run/credentials/${CRED_NAME}"
+
+          if [[ ! -f "$CRED_PATH" ]]; then
+            echo "ERROR: credential file not found at $CRED_PATH" >&2
+            exit 2
+          fi
+
+          # Read and output the credential (single-line secret)
+          head -n1 "$CRED_PATH"
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Deploy secure backup wrapper script (fetches password + runs backup)
+      copy:
+        dest: /home/mjouhari/run-restic-backup-secure.sh
+        content: |
+          #!/bin/bash
+          # Secure backup wrapper for systemd timer
+          # - Loads configuration from restic.env
+          # - Reads credential from systemd credential location
+          # - Exports RESTIC_PASSWORD and runs restic-backup.sh
+
+          set -euo pipefail
+
+          if [[ -f "${HOME}/restic.env" ]]; then
+            source "${HOME}/restic.env"
+          fi
+
+          CRED_NAME="${RESTIC_CRED_NAME:-restic-$(hostname -s)}"
+          CRED_PATH="/run/credentials/${CRED_NAME}"
+
+          if [[ ! -f "$CRED_PATH" ]]; then
+            echo "ERROR: credential not available at $CRED_PATH" >&2
+            exit 2
+          fi
+
+          RESTIC_PASSWORD=$(head -n1 "$CRED_PATH")
+          if [[ -z "$RESTIC_PASSWORD" ]]; then
+            echo "ERROR: empty RESTIC_PASSWORD from $CRED_PATH" >&2
+            exit 3
+          fi
+
+          export RESTIC_PASSWORD
+
+          # Run the main backup script (passes through any args)
+          bash "${HOME}/restic-backup.sh" "$@"
+
+          # On exit the password is only in process memory; /run/credentials is managed by systemd/tmpfs
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    # =========== PHASE 6: Cron Job Setup ===========
+    
+    # =========== PHASE 6: Systemd service & timer setup (replaces cron) ===========
+
+    - name: Ensure /run/credentials directory exists (tmpfs)
+      file:
+        path: /run/credentials
+        state: directory
+        owner: root
+        group: root
+        mode: '0711'
+
+    - name: Deploy restic credential file to /run/credentials (mjouhari-owned, 0600)
+      copy:
+        dest: "/run/credentials/{{ restic_cred_name }}"
+        content: "{{ restic_password | default('') }}\n"
+        owner: mjouhari
+        group: mjouhari
+        mode: '0600'
+      when: restic_password is defined
+
+    - name: Deploy systemd service unit (instance-based)
+      copy:
+        dest: /etc/systemd/system/restic-backup@.service
+        content: |
+          [Unit]
+          Description=Restic backup service for %i
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          # The service will read the credential from /run/credentials/restic-%i
+          ExecStart=/bin/bash /home/mjouhari/run-restic-backup-secure.sh %i
+          # Ensure the process runs as the backup user
+          User=mjouhari
+          Group=mjouhari
+          PrivateTmp=yes
+          NoNewPrivileges=yes
+
+        mode: '0644'
+
+    - name: Deploy systemd timer unit (instance-based)
+      copy:
+        dest: /etc/systemd/system/restic-backup@.timer
+        content: |
+          [Unit]
+          Description=Timer for restic-backup@%i
+
+          [Timer]
+          # We will use OnCalendar from the provided schedule (first two fields are minute/hour)
+          OnCalendar=*-*-* *:{{ item.schedule.split(' ')[1]|default('*') }}:{{ item.schedule.split(' ')[0]|default('0') }}
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        mode: '0644'
+      loop: "{{ backup_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: timer_deployed
+
+    - name: Reload systemd daemon after timer deployment
+      systemd:
+        daemon_reload: yes
+      when: timer_deployed is changed
+
+    - name: Enable and start timer instances
+      systemd:
+        name: "restic-backup@{{ item.name }}.timer"
+        enabled: yes
+        state: started
+      loop: "{{ backup_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
