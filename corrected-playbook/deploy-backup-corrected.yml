@@ -1,0 +1,288 @@
+---
+- name: Deploy Restic backup system
+  hosts: backup_servers
+  become: yes
+  vars_files:
+    - "/home/mjouhari/ansbackup/inventory/hosts_vars/vault.yml"
+
+  vars:
+    # Vault paths for storing passwords
+    vault_base_path: "restic/data"
+    vault_secret_path: "{{ vault_base_path }}/{{ inventory_hostname }}"
+
+  tasks:
+    # =========== PHASE 1: Setup (runs unconditionally) ===========
+    
+    - name: Copy restic backup script
+      copy:
+        src: /home/mjouhari/ansbackup/templates/scripts/backup-script.sh
+        dest: /home/mjouhari/restic-backup.sh
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+
+    - name: Ensure .ssh directory exists for mjouhari
+      file:
+        path: /home/mjouhari/.ssh
+        state: directory
+        owner: mjouhari
+        group: mjouhari
+        mode: '0700'
+
+    - name: Ensure log file exists with correct permissions
+      file:
+        path: /home/mjouhari/restic-backup.log
+        state: touch
+        owner: mjouhari
+        group: mjouhari
+        mode: '0644'
+
+    # =========== PHASE 2: Repository Detection ===========
+    
+    - name: Parse Restic repo path from sftp URL
+      set_fact:
+        # Extract components from sftp:user@host:/path format
+        restic_remote_user: "{{ (restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[0] }}"
+        restic_remote_host: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[1].split(':')[0]) if '@' in restic_repo else '87.106.192.195' }}"
+        restic_remote_dir: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split(':')[-1]) }}"
+
+    - name: Check if host-specific repository folder exists on remote
+      delegate_to: localhost
+      become: no
+      shell: |
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            -o PasswordAuthentication=no -o BatchMode=yes \
+          {{ restic_remote_user }}@{{ restic_remote_host }} \
+          "if [ -d '{{ restic_remote_dir }}/{{ inventory_hostname }}' ]; then echo 'exists'; else echo 'missing'; fi"
+      register: repo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display repository detection results
+      delegate_to: localhost
+      become: no
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════════
+          RESTIC REPOSITORY DETECTION - {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════════════
+          
+          Connection Details:
+            • Remote User: {{ restic_remote_user }}
+            • Remote Host: {{ restic_remote_host }}
+            • Repository Base Path: {{ restic_remote_dir }}
+            • Host Subdirectory: {{ restic_remote_dir }}/{{ inventory_hostname }}
+          
+          SSH Connection Status:
+          {% if repo_check.rc == 0 %}
+            ✓ SUCCESS
+          {% else %}
+            ✗ FAILED (rc={{ repo_check.rc }})
+            Error: {{ repo_check.stderr | default('unknown') }}
+          {% endif %}
+          
+          Repository Status:
+          {% if (repo_check.stdout | default('') | trim) == 'exists' %}
+            ✓ EXISTS - Will fetch password from Vault
+          {% else %}
+            ⚠ MISSING - Will generate new password and initialize
+          {% endif %}
+          
+          ═══════════════════════════════════════════════════════════════
+
+    - name: Set repository existence flag
+      set_fact:
+        repo_exists: "{{ (repo_check.stdout | default('') | trim) == 'exists' }}"
+        # Construct the full sftp URL for the host-specific repository
+        restic_repo_url: "sftp:{{ restic_remote_user }}@{{ restic_remote_host }}:{{ restic_remote_dir }}/{{ inventory_hostname }}"
+
+    # =========== PHASE 3: Password Handling ===========
+    
+    - name: Fetch Restic password from Vault (if repository exists)
+      community.hashi_vault.vault_read:
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        path: "{{ vault_secret_path }}"
+      register: vault_read
+      when: repo_exists | bool
+      ignore_errors: yes
+
+    - name: Extract password from Vault response (if fetch succeeded)
+      set_fact:
+        restic_password: >-
+          {{ (
+              (vault_read.data.data.restic_pass)
+              if (vault_read is defined and vault_read.data is defined and vault_read.data.data is defined and 'restic_pass' in vault_read.data.data)
+              else (
+                (vault_read.data.restic_pass)
+                if (vault_read is defined and vault_read.data is defined and 'restic_pass' in vault_read.data)
+                else ''
+              )
+            ) }}
+      when: repo_exists | bool and vault_read is defined and vault_read.failed is not defined
+      no_log: yes
+
+    - name: Generate new strong password (if repository missing)
+      set_fact:
+        restic_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      when: not (repo_exists | bool)
+      no_log: yes
+
+    - name: Store new password in Vault (if repository missing)
+      community.hashi_vault.vault_write:
+        url: "{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}/"
+        token: "{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        path: "{{ vault_secret_path }}"
+        data:
+          data:
+            restic_pass: "{{ restic_password }}"
+      when: not (repo_exists | bool)
+      no_log: yes
+
+    - name: Ensure password is defined (fallback)
+      set_fact:
+        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+      no_log: yes
+
+    # =========== PHASE 4: Repository Initialization ===========
+    
+    - name: Initialize repository with restic (if repository missing)
+      become_user: mjouhari
+      environment:
+        RESTIC_PASSWORD: "{{ restic_password }}"
+        RESTIC_REPOSITORY: "{{ restic_repo_url }}"
+        RESTIC_SFTP_ARGS: "-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+      command: restic init
+      register: repo_init
+      when: not (repo_exists | bool)
+      changed_when: "'created restic repository' in repo_init.stdout"
+      failed_when: repo_init.rc != 0 and "'already initialized' not in repo_init.stderr"
+      no_log: yes
+
+    # =========== PHASE 5: Runtime Configuration Files ===========
+    
+    - name: Create environment file for runtime (stores paths, not secrets)
+      copy:
+        dest: /home/mjouhari/restic.env
+        content: |
+          # Restic backup environment file for {{ inventory_hostname }}
+          # Generated by Ansible deployment
+          
+          # Repository configuration (with full sftp URL)
+          export RESTIC_REPOSITORY="{{ restic_repo_url }}"
+          export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key"
+          
+          # Logging
+          export LOG_FILE="/home/mjouhari/restic-backup.log"
+          
+          # Backup groups (defines what gets backed up and schedules)
+          export BACKUP_GROUPS='{{ backup_groups | to_json }}'
+          
+          # Vault configuration for runtime password fetching
+          export VAULT_ADDR="{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}"
+          export VAULT_TOKEN="{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+          export VAULT_SECRET_PATH="{{ vault_secret_path }}"
+        mode: '0600'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Deploy password fetcher script (queries Vault at runtime)
+      copy:
+        dest: /home/mjouhari/fetch-restic-password.sh
+        content: |
+          #!/bin/bash
+          # Fetches the Restic password from Vault at runtime
+          # Called by wrapper script before each backup
+          
+          set -euo pipefail
+          
+          # Load environment (contains VAULT_ADDR, VAULT_TOKEN, VAULT_SECRET_PATH)
+          if [[ -f "${HOME}/restic.env" ]]; then
+            source "${HOME}/restic.env"
+          else
+            echo "ERROR: restic.env not found at ${HOME}/restic.env" >&2
+            exit 1
+          fi
+          
+          # Query Vault for the secret
+          PASSWORD_RESPONSE=$(curl -s \
+            -H "X-Vault-Token: ${VAULT_TOKEN}" \
+            "${VAULT_ADDR}/v1/${VAULT_SECRET_PATH}")
+          
+          # Extract password from KV v2 response structure
+          RESTIC_PASSWORD=$(echo "$PASSWORD_RESPONSE" | jq -r '.data.data.restic_pass // empty')
+          
+          # Validate password was retrieved
+          if [[ -z "$RESTIC_PASSWORD" ]] || [[ "$RESTIC_PASSWORD" == "null" ]]; then
+            echo "ERROR: Failed to fetch password from Vault at ${VAULT_SECRET_PATH}" >&2
+            echo "Response: $PASSWORD_RESPONSE" >&2
+            exit 1
+          fi
+          
+          # Output password to stdout (caller will capture)
+          echo "$RESTIC_PASSWORD"
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Deploy secure backup wrapper script (fetches password + runs backup)
+      copy:
+        dest: /home/mjouhari/run-restic-backup-secure.sh
+        content: |
+          #!/bin/bash
+          # Secure backup wrapper
+          # 1. Loads configuration from restic.env
+          # 2. Fetches password from Vault at runtime
+          # 3. Passes password to restic-backup.sh via RESTIC_PASSWORD env var
+          # 4. Password is cleared from memory when script exits
+          
+          set -euo pipefail
+          
+          # Load environment (Vault config, RESTIC_REPOSITORY, BACKUP_GROUPS, etc.)
+          if [[ -f "${HOME}/restic.env" ]]; then
+            source "${HOME}/restic.env"
+          else
+            echo "ERROR: restic.env not found at ${HOME}/restic.env" >&2
+            exit 1
+          fi
+          
+          # Fetch password from Vault (helper script handles curl/jq)
+          RESTIC_PASSWORD=$(bash "${HOME}/fetch-restic-password.sh")
+          
+          if [[ -z "$RESTIC_PASSWORD" ]]; then
+            echo "ERROR: Could not retrieve RESTIC_PASSWORD from Vault" >&2
+            exit 1
+          fi
+          
+          # Export password so child processes (restic-backup.sh) can use it
+          export RESTIC_PASSWORD
+          
+          # Run the main backup script with optional group filter
+          # Usage: run-restic-backup-secure.sh [group_name]
+          bash "${HOME}/restic-backup.sh" "$@"
+          
+          # Password is cleared from this process' memory when script exits
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    # =========== PHASE 6: Cron Job Setup ===========
+    
+    - name: Create cron jobs for backup schedules
+      cron:
+        name: "Restic backup - {{ item.name }}"
+        user: mjouhari
+        minute: "{{ item.schedule.split(' ')[0] }}"
+        hour: "{{ item.schedule.split(' ')[1] }}"
+        day: "{{ item.schedule.split(' ')[2] | default('*') }}"
+        month: "{{ item.schedule.split(' ')[3] | default('*') }}"
+        weekday: "{{ item.schedule.split(' ')[4] | default('*') }}"
+        # Cron job calls wrapper which fetches password and runs backup
+        job: "bash -c '{{ item.restic_base_dir | default('/home/mjouhari') }}/run-restic-backup-secure.sh {{ item.name }} >> {{ item.restic_base_dir | default('/home/mjouhari') }}/restic-backup.log 2>&1'"
+        state: present
+      loop: "{{ backup_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
