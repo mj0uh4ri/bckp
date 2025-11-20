@@ -1,0 +1,259 @@
+---
+- name: Deploy Restic backup system
+  hosts: backup_servers
+  become: yes
+  vars_files:
+    - "/home/mjouhari/ansbackup/inventory/hosts_vars/vault.yml"
+
+  vars:
+    vault_base_path: "restic"
+    vault_secret_path: "{{ vault_base_path }}/{{ inventory_hostname }}"
+
+  tasks:
+    # =========== PHASE 0: Prepare backup groups for export ===========
+
+    - name: Construct clean backup groups (exclude schedule field)
+      set_fact:
+        backup_groups_clean: "{{ backup_groups | map('combine', {}) | map('dict2items') | map('rejectattr', 'key', 'equalto', 'schedule') | map('items2dict') | list }}"
+
+    # =========== PHASE 1: Initial Setup ===========
+    
+    - name: Copy restic backup script
+      copy:
+        src: /home/mjouhari/ansbackup/templates/scripts/backup-script.sh
+        dest: /home/mjouhari/restic-backup.sh
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+
+    - name: Ensure .ssh directory exists for mjouhari
+      file:
+        path: /home/mjouhari/.ssh
+        state: directory
+        owner: mjouhari
+        group: mjouhari
+        mode: '0700'
+
+    - name: Ensure log file exists with correct permissions
+      file:
+        path: /home/mjouhari/restic-backup.log
+        state: touch
+        owner: mjouhari
+        group: mjouhari
+        mode: '0644'
+
+    # =========== PHASE 2: Repository Detection ===========
+    
+    - name: Parse Restic repo path from sftp URL
+      set_fact:
+        restic_remote_user: "{{ (restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[0] }}"
+        restic_remote_host: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split('@')[1].split(':')[0]) if '@' in restic_repo else '87.106.192.195' }}"
+        restic_remote_dir: "{{ ((restic_repo.split('sftp:', 1)[-1] if restic_repo.startswith('sftp:') else restic_repo).split(':')[-1]) }}"
+
+    - name: Check if host-specific repository folder exists on remote
+      delegate_to: localhost
+      become: no
+      shell: |
+        ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+            -o PasswordAuthentication=no -o BatchMode=yes \
+          {{ restic_remote_user }}@{{ restic_remote_host }} \
+          "if [ -d '{{ restic_remote_dir }}/{{ inventory_hostname }}' ]; then echo 'exists'; else echo 'missing'; fi"
+      register: repo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set repository existence flag
+      set_fact:
+        repo_exists: "{{ (repo_check.stdout | default('') | trim) == 'exists' }}"
+        restic_repo_url: "sftp:{{ restic_remote_user }}@{{ restic_remote_host }}:{{ restic_remote_dir }}/{{ inventory_hostname }}"
+
+    - name: Display repository detection results
+      delegate_to: localhost
+      become: no
+      debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════
+          RESTIC REPOSITORY DETECTION - {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════════════
+          
+          Connection Details:
+            • Remote User: {{ restic_remote_user }}
+            • Remote Host: {{ restic_remote_host }}
+            • Repository Base Path: {{ restic_remote_dir }}
+            • Host Subdirectory: {{ restic_remote_dir }}/{{ inventory_hostname }}
+          
+          Repository Status:
+          {% if repo_exists %}
+            ✓ EXISTS - Will fetch password from Vault
+          {% else %}
+            ⚠ MISSING - Will generate new password and initialize
+          {% endif %}
+          
+          ════════════════════════════════════════════════════════════════
+
+    # =========== PHASE 3: Password Handling (Controller-side) ===========
+    
+    - name: Fetch Restic password from Vault on controller (if repo exists)
+      delegate_to: localhost
+      become: no
+      shell: |
+        export VAULT_ADDR="{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}"
+        export VAULT_TOKEN="{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        # Try to read only the password field; compatible with kv v1 and kv v2
+        vault kv get -field=restic_pass {{ vault_secret_path }} 2>/dev/null || true
+      register: vault_pass_cmd
+      when: repo_exists | bool
+      changed_when: false
+      failed_when: false
+      no_log: yes
+
+    - name: Extract password from Vault CLI output (fallback-safe)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: "{{ vault_pass_cmd.stdout | default('') }}"
+      when: repo_exists | bool and vault_pass_cmd is defined and (vault_pass_cmd.stdout | length) > 0
+      no_log: yes
+
+    - name: Generate new strong password (if repo missing)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+      when: not (repo_exists | bool)
+      
+
+    - name: Store new password in Vault (if repo missing)
+      delegate_to: localhost
+      become: no
+      shell: |
+        export VAULT_ADDR="{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}"
+        export VAULT_TOKEN="{{ vault_token | default(lookup('env','VAULT_TOKEN')) }}"
+        # Write the restic password using the Vault CLI (handles kv v1/v2 mount transparently)
+        vault kv put {{ vault_secret_path }} restic_pass="{{ restic_password }}"
+      register: vault_put_cmd
+      when: not (repo_exists | bool)
+      changed_when: vault_put_cmd.rc == 0
+      failed_when: vault_put_cmd.rc != 0
+      no_log: yes
+
+    - name: Ensure password is defined (fallback)
+      delegate_to: localhost
+      become: no
+      set_fact:
+        restic_password: "{{ restic_password | default(lookup('password', '/dev/null length=32')) }}"
+      no_log: yes
+
+    # =========== PHASE 4: Repository Initialization ===========
+    
+    - name: Initialize repository if missing
+      become_user: mjouhari
+      environment:
+        RESTIC_PASSWORD: "{{ restic_password }}"
+        RESTIC_REPOSITORY: "{{ restic_repo_url }}"
+        RESTIC_SFTP_ARGS: "-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+      command: restic init
+      register: repo_init
+      when: not (repo_exists | bool)
+      changed_when: "'created restic repository' in repo_init.stdout"
+      failed_when: repo_init.rc != 0 and "'already initialized' not in repo_init.stderr"
+      no_log: yes
+
+    # =========== PHASE 5: Deploy Configuration Files ===========
+    
+    - name: Create environment file for runtime
+      copy:
+        dest: /home/mjouhari/restic.env
+        content: |
+          # Restic backup environment file for {{ inventory_hostname }}
+          # Generated by Ansible deployment
+          
+          # Vault configuration for autonomous password retrieval
+          export VAULT_ADDR="{{ vault_addr | default(lookup('env','VAULT_ADDR')) }}"
+          export VAULT_SECRET_PATH="{{ vault_secret_path }}"
+          
+          # Repository configuration
+          export RESTIC_REPOSITORY="{{ restic_repo_url }}"
+          export RESTIC_SFTP_ARGS="-o IdentitiesOnly=yes -i /home/mjouhari/.ssh/restic_key -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          
+          # Logging
+          export LOG_FILE="/home/mjouhari/restic-backup.log"
+          
+          # Backup groups (defines what gets backed up)
+          # The full JSON is written to a separate file to avoid shell-quoting/truncation issues.
+          export BACKUP_GROUPS_FILE="/home/mjouhari/backup-groups.json"
+        mode: '0600'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Write backup groups JSON to a separate file
+      copy:
+        dest: /home/mjouhari/backup-groups.json
+        content: |
+          {{ backup_groups_clean | to_nice_json }}
+        mode: '0600'
+        owner: mjouhari
+        group: mjouhari
+      become_user: mjouhari
+
+    - name: Deploy backup script (with Vault password fetching)
+      copy:
+        src: /home/mjouhari/ansbackup/templates/scripts/backup-script-autofetch.sh
+        dest: /home/mjouhari/restic-backup.sh
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+        mode: '0750'
+        owner: mjouhari
+        group: mjouhari
+
+
+    - name: Create cron jobs from backup_groups
+      cron:
+        name: "Restic backup - {{ item.name }}"
+        user: mjouhari
+        minute: "{{ (item.schedule.split(' '))[0] }}"
+        hour: "{{ (item.schedule.split(' '))[1] }}"
+        day: "{{ (item.schedule.split(' '))[2] | default('*') }}"
+        month: "{{ (item.schedule.split(' '))[3] | default('*') }}"
+        weekday: "{{ (item.schedule.split(' '))[4] | default('*') }}"
+        job: "source /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh >> /home/mjouhari/restic-backup.log 2>&1"
+        state: present
+      loop: "{{ backup_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+
+
+    - name: Display deployment summary
+      delegate_to: localhost
+      become: no
+      debug:
+        msg: |
+          ════════════════════════════════════════════════════════════════
+          DEPLOYMENT COMPLETE - {{ inventory_hostname }}
+          ════════════════════════════════════════════════════════════════
+          
+          Files deployed:
+            ✓ /home/mjouhari/restic-backup.sh (executable backup script)
+            ✓ /home/mjouhari/restic.env (configuration file)
+            ✓ /home/mjouhari/restic-backup.log (log file)
+          
+          Configuration:
+            • Repository: {{ restic_repo_url }}
+            • Vault Secret Path: {{ vault_secret_path }}
+            • User: mjouhari
+          
+          To run backup manually:
+            1. Ensure VAULT_TOKEN is set: export VAULT_TOKEN="..."
+            2. Source environment: source ~/restic.env
+            3. Run backup: ~/restic-backup.sh
+          
+          The script will:
+            → Fetch RESTIC_PASSWORD from Vault using user's VAULT_TOKEN
+            → Execute backup for all groups in BACKUP_GROUPS
+            → Apply retention policies
+            → Verify repository integrity
+          
+          ════════════════════════════════════════════════════════════════
