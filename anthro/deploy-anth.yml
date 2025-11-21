@@ -181,7 +181,7 @@
           
           # Backup groups (defines what gets backed up)
           # The full JSON is written to a separate file to avoid shell-quoting/truncation issues.
-          export BACKUP_GROUPS_FILE="/home/mjouhari/backup-groups.json"
+          export BACKUP_GROUPS="/home/mjouhari/backup-groups.json"
         mode: '0600'
         owner: mjouhari
         group: mjouhari
@@ -199,7 +199,7 @@
 
     - name: Deploy backup script (with Vault password fetching)
       copy:
-        src: /home/mjouhari/ansbackup/templates/scripts/backup-script-autofetch.sh
+        src: /home/mjouhari/ansbackup/templates/scripts/backup-script.sh
         dest: /home/mjouhari/restic-backup.sh
         mode: '0750'
         owner: mjouhari
@@ -218,7 +218,7 @@
         day: "{{ (item.schedule.split(' '))[2] | default('*') }}"
         month: "{{ (item.schedule.split(' '))[3] | default('*') }}"
         weekday: "{{ (item.schedule.split(' '))[4] | default('*') }}"
-        job: "source /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh >> /home/mjouhari/restic-backup.log 2>&1"
+        job: 'bash -c "source /home/mjouhari/restic.env && /home/mjouhari/restic-backup.sh {{ item.name }} >> /home/mjouhari/restic-backup.log 2>&1"'
         state: present
       loop: "{{ backup_groups }}"
       loop_control:
